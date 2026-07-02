@@ -12,14 +12,14 @@ implementation is provided [`Get-AzMCResource.ps1`](Get-AzMCResource.ps1).
 
 - Resolve a **resource type + version** (e.g. `Microsoft.GuestConfiguration/users` @
   `2026-06-30-preview`) to a concrete, platform-specific package archive.
-- Track locally registered resources so the client can periodically discover package
-  updates for resources already in use.
-- Discover service endpoints dynamically so the client is not hard-coded to a single
-  environment (public cloud, sovereign cloud, or a local test server).
 - Download, integrity-check, and extract packages into a predictable layout.
 - Make installed resources discoverable by the DSCv3 engine via `DSC_RESOURCE_PATH`.
+- Track locally registered resources so the client can periodically discover package
+  updates for resources already in use.
 - Clean up cached package versions that are no longer required by any registered
   resource.
+- Discover service endpoints dynamically so the client is not hard-coded to a single
+  environment (public cloud, sovereign cloud, or a local test server).
 
 ## Non-goals
 
