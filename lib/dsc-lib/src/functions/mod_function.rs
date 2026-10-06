@@ -16,6 +16,8 @@ impl Function for Mod {
         FunctionMetadata {
             name: "mod".to_string(),
             description: t!("functions.mod.description").to_string(),
+            syntax: t!("functions.mod.syntax").to_string(),
+            constraints: None,
             category: vec![FunctionCategory::Numeric],
             min_args: 2,
             max_args: 2,
@@ -29,7 +31,7 @@ impl Function for Mod {
     }
 
     fn invoke(&self, args: &[Value], _context: &Context) -> Result<Value, DscError> {
-        debug!("mod function");
+        debug!("{}", t!("functions.mod.invoked"));
         if let (Some(arg1), Some(arg2)) = (args[0].as_i64(), args[1].as_i64()) {
             if arg2 == 0 {
                 return Err(DscError::Parser(t!("functions.mod.divideByZero").to_string()));

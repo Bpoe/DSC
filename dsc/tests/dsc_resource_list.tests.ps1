@@ -25,10 +25,10 @@ Describe 'Tests for listing resources' {
 
     It 'dsc resource list --tags "<tags>" and --description "<description> work' -TestCases @(
         if ($IsLinux) {
-            @{ tags = 'linux'; description = $null; expectedCount = 2; expectedType = @('DSC.PackageManagement/Apt', 'Microsoft/OSInfo') }
+            @{ tags = 'linux'; description = $null; expectedCount = 3; expectedType = @('DSC.PackageManagement/Apt', 'Microsoft.Filesystem.File/Content', 'Microsoft/OSInfo') }
         }
         else {
-            @{ tags = 'linux'; description = $null; expectedCount = 1; expectedType = 'Microsoft/OSInfo' }
+            @{ tags = 'linux'; description = $null; expectedCount = 2; expectedType = @('Microsoft.Filesystem.File/Content', 'Microsoft/OSInfo') }
         }
         @{ tags = $null; description = 'operating system'; expectedCount = 1; expectedType = 'Microsoft/OSInfo' }
         @{ tags = 'linux'; description = 'operating system'; expectedCount = 1; expectedType = 'Microsoft/OSInfo' }
@@ -38,10 +38,10 @@ Describe 'Tests for listing resources' {
     ) {
         param($tags, $description, $expectedCount, $expectedType)
 
-        $oldPath = $env:DSC_RESOURCE_PATH
+        $oldPath = $env:DSC_RESTRICTED_PATH
         try {
             # Need to restrict the search as more resources are being added like from PS7
-            $env:DSC_RESOURCE_PATH = Split-Path (Get-Command dsc).Source -Parent
+            $env:DSC_RESTRICTED_PATH = Split-Path (Get-Command dsc).Source -Parent
 
             if ($tags -and $description) {
                 $resources = dsc resource list --tags $tags --description $description | ConvertFrom-Json
@@ -59,7 +59,7 @@ Describe 'Tests for listing resources' {
                 $resources.type | Should -BeExactly $expectedType
             }
         } finally {
-            $env:DSC_RESOURCE_PATH = $oldPath
+            $env:DSC_RESTRICTED_PATH = $oldPath
         }
     }
 
@@ -148,9 +148,9 @@ Describe 'Tests for listing resources' {
         Set-Content -Path $manifestPath -Value $resource_manifest
         Set-Content -Path $manifestDupePath -Value $resource_manifest
 
-        $oldPath = $env:DSC_RESOURCE_PATH
+        $oldPath = $env:DSC_RESTRICTED_PATH
         try {
-            $env:DSC_RESOURCE_PATH = $TestDrive + [System.IO.Path]::PathSeparator + $env:PATH
+            $env:DSC_RESTRICTED_PATH = $TestDrive + [System.IO.Path]::PathSeparator + $env:PATH
             $resources = dsc resource list | ConvertFrom-Json
             $LASTEXITCODE | Should -Be 0
             $resourceGroups = $resources | Group-Object -Property type, version
@@ -158,7 +158,7 @@ Describe 'Tests for listing resources' {
                 $group.Count | Should -Be 1 -Because ($resources | ConvertTo-Json -Depth 20)
             }
         } finally {
-            $env:DSC_RESOURCE_PATH = $oldPath
+            $env:DSC_RESTRICTED_PATH = $oldPath
         }
     }
 

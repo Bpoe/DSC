@@ -1,10 +1,10 @@
 {
   "adaptedResources": [
     {
-      "$schema": "https://aka.ms/dsc/schemas/v3/bundled/adaptedresource/manifest.json",
+      "$schema": "https://aka.ms/dsc/schemas/v3/bundled/resource/adapted/manifest.json",
       "type": "Adapted/Two",
       "kind": "resource",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "capabilities": [
         "get",
         "set",
@@ -38,7 +38,7 @@
       }
     },
     {
-      "$schema": "https://aka.ms/dsc/schemas/v3/bundled/adaptedresource/manifest.json",
+      "$schema": "https://aka.ms/dsc/schemas/v3/bundled/resource/adapted/manifest.json",
       "type": "Adapted/Four",
       "kind": "resource",
       "version": "1.0.0",
@@ -58,6 +58,169 @@
           "$schema": "http://json-schema.org/draft-07/schema#",
           "$id": "https://github.com/powershell/dsc",
           "title": "AdaptedFour",
+          "description": "An adapted resource for testing.",
+          "type": "object",
+          "required": [],
+          "additionalProperties": false,
+          "properties": {
+            "two": {
+              "type": "string",
+              "title": "Property Two",
+              "description": "This is property two of the adapted resource."
+            },
+            "name": {
+              "type": "string",
+              "title": "Name",
+              "description": "The name of the adapted resource instance."
+            }
+          }
+        }
+      }
+    },
+    {
+      "$schema": "https://aka.ms/dsc/schemas/v3/bundled/resource/adapted/manifest.json",
+      "type": "Adapted/SecurityContextElevated",
+      "kind": "resource",
+      "version": "1.0.0",
+      "capabilities": [
+        "get",
+        "set",
+        "delete",
+        "test",
+        "export"
+      ],
+      "description": "An adapted resource for testing.",
+      "author": "DSC Team",
+      "requireAdapter": "Test/Adapter",
+      "path": "adaptedTest.dsc.adaptedResource.json",
+      "get": {
+        "requireSecurityContext": "elevated"
+      },
+      "set": {
+        "requireSecurityContext": "elevated"
+      },
+      "test": {
+        "requireSecurityContext": "elevated"
+      },
+      "delete": {
+        "requireSecurityContext": "elevated"
+      },
+      "export": {
+        "requireSecurityContext": "elevated"
+      },
+      "schema": {
+        "embedded": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "$id": "https://github.com/powershell/dsc",
+          "title": "Adapted/SecurityContextElevated",
+          "description": "An adapted resource for testing.",
+          "type": "object",
+          "required": [],
+          "additionalProperties": false,
+          "properties": {
+            "one": {
+              "type": "string",
+              "title": "Property One",
+              "description": "This is property one of the adapted resource."
+            },
+            "name": {
+              "type": "string",
+              "title": "Name",
+              "description": "The name of the adapted resource instance."
+            }
+          }
+        }
+      }
+    },
+    {
+      "$schema": "https://aka.ms/dsc/schemas/v3/bundled/resource/adapted/manifest.json",
+      "type": "Adapted/SecurityContextRestricted",
+      "kind": "resource",
+      "version": "1.0.0",
+      "capabilities": [
+        "get",
+        "set",
+        "test",
+        "export"
+      ],
+      "description": "An adapted resource for testing.",
+      "author": "DSC Team",
+      "requireAdapter": "Test/Adapter",
+      "path": "adaptedTest.dsc.adaptedResource.json",
+      "get": {
+        "requireSecurityContext": "restricted"
+      },
+      "set": {
+        "requireSecurityContext": "restricted"
+      },
+      "test": {
+        "requireSecurityContext": "restricted"
+      },
+      "delete": {
+        "requireSecurityContext": "restricted"
+      },
+      "export": {
+        "requireSecurityContext": "restricted"
+      },
+      "schema": {
+        "embedded": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "$id": "https://github.com/powershell/dsc",
+          "title": "Adapted/SecurityContextRestricted",
+          "description": "An adapted resource for testing.",
+          "type": "object",
+          "required": [],
+          "additionalProperties": false,
+          "properties": {
+            "two": {
+              "type": "string",
+              "title": "Property Two",
+              "description": "This is property two of the adapted resource."
+            },
+            "name": {
+              "type": "string",
+              "title": "Name",
+              "description": "The name of the adapted resource instance."
+            }
+          }
+        }
+      }
+    },
+    {
+      "$schema": "https://aka.ms/dsc/schemas/v3/bundled/resource/adapted/manifest.json",
+      "type": "Adapted/SecurityContextCurrent",
+      "kind": "resource",
+      "version": "1.0.0",
+      "capabilities": [
+        "get",
+        "set",
+        "test",
+        "export"
+      ],
+      "description": "An adapted resource for testing.",
+      "author": "DSC Team",
+      "requireAdapter": "Test/Adapter",
+      "path": "adaptedTest.dsc.adaptedResource.json",
+      "get": {
+        "requireSecurityContext": "current"
+      },
+      "set": {
+        "requireSecurityContext": "current"
+      },
+      "test": {
+        "requireSecurityContext": "current"
+      },
+      "delete": {
+        "requireSecurityContext": "current"
+      },
+      "export": {
+        "requireSecurityContext": "current"
+      },
+      "schema": {
+        "embedded": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "$id": "https://github.com/powershell/dsc",
+          "title": "Adapted/SecurityContextCurrent",
           "description": "An adapted resource for testing.",
           "type": "object",
           "required": [],
@@ -277,6 +440,92 @@
             "-s",
             "get"
           ]
+        }
+      }
+    },
+    {
+      "$schema": "https://aka.ms/dsc/schemas/v3/bundled/resource/manifest.json",
+      "type": "Test/SchemaDefault",
+      "version": "0.1.0",
+      "get": {
+        "executable": "dsctest",
+        "args": [
+          "schema-default",
+          {
+            "jsonInputArg": "--input",
+            "mandatory": true
+          }
+        ]
+      },
+      "schema": {
+        "embedded": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "required": ["name"],
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "The name of the resource instance."
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "Whether the resource is enabled.",
+              "default": true
+            },
+            "count": {
+              "type": "integer",
+              "description": "The count value.",
+              "default": 5
+            },
+            "nested": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["value"],
+              "properties": {
+                "value": {
+                  "type": "string"
+                },
+                "secret": {
+                  "type": "object",
+                  "writeOnly": true,
+                  "additionalProperties": false,
+                  "required": ["token"],
+                  "properties": {
+                    "token": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "referencedNested": {
+              "$ref": "#/$defs/nested"
+            }
+          },
+          "$defs": {
+            "nested": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["value"],
+              "properties": {
+                "value": {
+                  "type": "string"
+                },
+                "secret": {
+                  "type": "object",
+                  "writeOnly": true,
+                  "additionalProperties": false,
+                  "required": ["token"],
+                  "properties": {
+                    "token": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -747,6 +996,40 @@
     },
     {
       "$schema": "https://aka.ms/dsc/schemas/v3/bundled/resource/manifest.json",
+      "type": "Test/Set",
+      "version": "0.1.0",
+      "get": {
+        "executable": "dsctest",
+        "args": [
+          "set",
+          "--get"
+        ]
+      },
+      "set": {
+        "executable": "dsctest",
+        "args": [
+          "set",
+          {
+            "jsonInputArg": "--input",
+            "mandatory": true
+          }
+        ],
+        "return": "state",
+        "implementsPretest": true
+      },
+      "schema": {
+        "command": {
+          "executable": "dsctest",
+          "args": [
+            "schema",
+            "-s",
+            "set"
+          ]
+        }
+      }
+    },
+    {
+      "$schema": "https://aka.ms/dsc/schemas/v3/bundled/resource/manifest.json",
       "type": "Test/Sleep",
       "version": "0.1.0",
       "get": {
@@ -951,6 +1234,9 @@
           },
           {
             "resourcePathArg": "--resource-path"
+          },
+          {
+            "resourceVersionArg": "--resource-version"
           }
         ]
       },
@@ -970,7 +1256,34 @@
           {
             "resourcePathArg": "--resource-path",
             "includeQuotes": true
+          },
+          {
+            "resourceVersionArg": "--resource-version"
           }
+
+        ]
+      },
+      "delete": {
+        "executable": "dsctest",
+        "args": [
+          "adapter",
+          "--operation",
+          "delete",
+          {
+            "jsonInputArg": "--input",
+            "mandatory": true
+          },
+          {
+            "resourceTypeArg": "--resource-type"
+          },
+          {
+            "resourcePathArg": "--resource-path",
+            "includeQuotes": true
+          },
+          {
+            "resourceVersionArg": "--resource-version"
+          }
+
         ]
       },
       "test": {
@@ -985,7 +1298,11 @@
           },
           {
             "resourceTypeArg": "--resource-type"
+          },
+          {
+            "resourceVersionArg": "--resource-version"
           }
+
         ]
       },
       "export": {
@@ -1000,6 +1317,9 @@
           },
           {
             "resourceTypeArg": "--resource-type"
+          },
+          {
+            "resourceVersionArg": "--resource-version"
           }
         ]
       },

@@ -387,13 +387,9 @@ function Get-RustUp {
         if ($null -ne (Get-Command msrustup -CommandType Application -ErrorAction Ignore)) {
             Write-Verbose -Verbose "Using msrustup"
             $rustup = 'msrustup'
-            $channel = 'ms-prod-1.95'
-            if ($architecture -eq 'current') {
-                $env:MSRUSTUP_TOOLCHAIN = "$architecture"
-            }
+            $channel = 'ms-prod-1.97.1'
         } elseif ($null -ne (Get-Command rustup -CommandType Application -ErrorAction Ignore)) {
                 $rustup = 'rustup'
-                $env:TESTING_FUNCTION_ENV = "lolwhat"
         }
 
         return $rustup, $channel
@@ -1602,8 +1598,7 @@ function Build-RustProject {
         [switch]$Clean,
         [switch]$UpdateLockFile,
         [switch]$Audit,
-        [switch]$Clippy,
-        [switch]$CodeCoverage
+        [switch]$Clippy
     )
 
     begin {
@@ -1875,14 +1870,14 @@ function Get-ChangedRustFile {
     )
 
     process {
-        $changedFiles = git diff --name-only --diff-filter=ACMR "$BaseSha...$HeadSha" -- '*.rs'
+        $changedFiles = git diff --name-only --diff-filter=ACMR "$BaseSha..$HeadSha" -- '*.rs'
         if ($LASTEXITCODE -ne 0) {
             Write-Warning "Failed to detect changed files between $BaseSha and $HeadSha"
             return @()
         }
 
         $result = @($changedFiles | Where-Object { $_ })
-        Write-Verbose "Found $($result.Count) changed Rust file(s)"
+        Write-Verbose -Verbose "Found $($result.Count) changed Rust file(s)"
         return $result
     }
 }
@@ -1894,9 +1889,9 @@ function Initialize-CodeCoverage {
 
         .DESCRIPTION
         Installs cargo-llvm-cov if needed and cleans any prior coverage artifacts from the
-        workspace. When coverage is enabled, Build-RustProject and Test-RustProject use
-        `cargo llvm-cov build` and `cargo llvm-cov test --no-report` respectively, which
-        handle all instrumentation and profraw management internally.
+        workspace. After initialization, call Set-LlvmCovEnvironment to set the environment
+        variables that make normal `cargo build` and `cargo test` invocations produce
+        instrumented binaries and write profraw data.
     #>
     [CmdletBinding()]
     param(
@@ -1916,6 +1911,77 @@ function Initialize-CodeCoverage {
         if ($LASTEXITCODE -ne 0) {
             Write-Warning 'Failed to clean previous coverage artifacts, continuing anyway'
         }
+    }
+}
+
+function Set-LlvmCovEnvironment {
+    <#
+        .SYNOPSIS
+        Sets the environment variables required by cargo-llvm-cov for instrumented builds.
+
+        .DESCRIPTION
+        Parses the output of `cargo llvm-cov show-env` and sets the corresponding
+        environment variables (LLVM_PROFILE_FILE, RUSTC_WRAPPER, CARGO_LLVM_COV, etc.)
+        in the current process. This enables a normal `cargo build` to produce
+        instrumented binaries, and allows externally invoked instrumented binaries
+        (such as during Pester tests) to write profraw data to a location that
+        `cargo llvm-cov report` can discover.
+
+        .OUTPUTS
+        System.Collections.Hashtable — Prior values of the modified environment variables
+        so they can be restored with Reset-LlvmCovEnvironment.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    process {
+        $showEnvOutput = cargo llvm-cov show-env 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to retrieve cargo-llvm-cov environment: $showEnvOutput"
+        }
+
+        $priorValues = @{}
+        foreach ($line in $showEnvOutput) {
+            if ($line -match '^([A-Z_][A-Z0-9_]+)=(.*)$') {
+                $name = $Matches[1]
+                # CARGO_LLVM_COV_SHOW_ENV is an output-only flag that tells
+                # cargo-llvm-cov to print env and exit; do not propagate it.
+                if ($name -eq 'CARGO_LLVM_COV_SHOW_ENV') {
+                    continue
+                }
+                # Strip optional surrounding single quotes from the value
+                $value = ($Matches[2] -replace "^'", '') -replace "'$", ''
+                $priorValues[$name] = [System.Environment]::GetEnvironmentVariable($name)
+                [System.Environment]::SetEnvironmentVariable($name, $value)
+                Write-Verbose "Set $name=$value"
+            }
+        }
+
+        Write-Verbose -Verbose "Set $($priorValues.Count) cargo-llvm-cov environment variables"
+        $priorValues
+    }
+}
+
+function Reset-LlvmCovEnvironment {
+    <#
+        .SYNOPSIS
+        Restores environment variables modified by Set-LlvmCovEnvironment.
+
+        .PARAMETER PriorValues
+        The hashtable returned by Set-LlvmCovEnvironment containing original values.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$PriorValues
+    )
+
+    process {
+        foreach ($entry in $PriorValues.GetEnumerator()) {
+            [System.Environment]::SetEnvironmentVariable($entry.Key, $entry.Value)
+        }
+        Write-Verbose -Verbose "Restored $($PriorValues.Count) environment variables"
     }
 }
 
@@ -1944,6 +2010,295 @@ function Export-CodeCoverageReport {
             throw "Failed to generate code coverage report at '$OutputPath'"
         }
         Write-Verbose -Verbose "Code coverage report written to: $OutputPath"
+    }
+}
+
+function Export-PesterCodeCoverageReport {
+    <#
+        .SYNOPSIS
+        Generates an LCOV code coverage report from profraw files produced by instrumented binaries.
+
+        .DESCRIPTION
+        Uses llvm-profdata and llvm-cov directly (from the rustup llvm-tools-preview component)
+        to merge raw profile data and export an LCOV report. This is used by Pester test jobs
+        that run instrumented binaries outside of the cargo build environment.
+
+        .PARAMETER BinDirectory
+        Path to the directory containing instrumented binaries (e.g., bin/).
+
+        .PARAMETER ProfileDirectory
+        Path to the directory containing .profraw files produced by instrumented binaries.
+
+        .PARAMETER OutputPath
+        The file path where the LCOV report will be written.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$BinDirectory,
+
+        [Parameter(Mandatory)]
+        [string]$ProfileDirectory,
+
+        [Parameter(Mandatory)]
+        [string]$OutputPath
+    )
+
+    process {
+        # Find the llvm tools from rustup
+        $toolchainPath = & rustc --print sysroot 2>$null
+        if (-not $toolchainPath) {
+            throw 'Could not determine Rust toolchain sysroot. Ensure rustc is installed.'
+        }
+
+        $hostTriple = & rustc -vV |
+            Select-String 'host: (.+)' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+        if (-not $hostTriple) {
+            throw 'Could not determine Rust host triple from rustc -vV output.'
+        }
+
+        $llvmBinDir = [System.IO.Path]::Combine($toolchainPath, 'lib', 'rustlib', $hostTriple, 'bin')
+
+        $llvmProfdata = Join-Path $llvmBinDir 'llvm-profdata'
+        $llvmCov = Join-Path $llvmBinDir 'llvm-cov'
+
+        if ($IsWindows) {
+            $llvmProfdata += '.exe'
+            $llvmCov += '.exe'
+        }
+
+        if (-not (Test-Path $llvmProfdata)) {
+            throw "llvm-profdata not found at '$llvmProfdata'. Ensure llvm-tools-preview is installed via: rustup component add llvm-tools-preview"
+        }
+        if (-not (Test-Path $llvmCov)) {
+            throw "llvm-cov not found at '$llvmCov'. Ensure llvm-tools-preview is installed via: rustup component add llvm-tools-preview"
+        }
+
+        # Find all profraw files
+        $profrawFiles = @(Get-ChildItem -Path $ProfileDirectory -Filter '*.profraw' -Recurse -ErrorAction SilentlyContinue)
+        if ($profrawFiles.Count -eq 0) {
+            Write-Warning "No .profraw files found in '$ProfileDirectory'. Coverage report will be empty."
+            return
+        }
+        Write-Verbose -Verbose "Found $($profrawFiles.Count) profraw file(s)"
+
+        # Merge profraw files into a single profdata file
+        $profdataPath = Join-Path $ProfileDirectory 'merged.profdata'
+
+        # Write file list to a response file to avoid command-line length limits on Windows
+        $responseFile = Join-Path $ProfileDirectory 'profraw-files.txt'
+        $profrawFiles.FullName | Set-Content -Path $responseFile -Encoding utf8
+
+        Write-Verbose -Verbose "Merging profraw files into: $profdataPath (via response file)"
+        & $llvmProfdata merge -sparse "@$responseFile" -o $profdataPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "llvm-profdata merge failed with exit code $LASTEXITCODE"
+        }
+
+        # Find all executable binaries in the bin directory.
+        # On Unix, Rust produces binaries with no file extension. We identify them by
+        # excluding known non-binary extensions. We cannot rely solely on the execute
+        # permission bit because artifact upload/download may not preserve it.
+        $nonBinaryExtensions = @('.pdb', '.d', '.ps1', '.psm1', '.psd1', '.json', '.yaml', '.yml', '.txt', '.md', '.sh')
+        $binaries = @(
+            if ($IsWindows) {
+                Get-ChildItem -Path $BinDirectory -Filter '*.exe' -File
+            } else {
+                Get-ChildItem -Path $BinDirectory -File | Where-Object {
+                    -not $_.Extension -or
+                    ($_.Extension -notin $nonBinaryExtensions -and
+                     $_.UnixMode -and $_.UnixMode -match 'x')
+                }
+            }
+        )
+
+        if ($binaries.Count -eq 0) {
+            Write-Warning "No executable binaries found in '$BinDirectory'. Cannot generate coverage report."
+            return
+        }
+        Write-Verbose -Verbose "Using $($binaries.Count) binary file(s) for coverage export"
+
+        # Build llvm-cov export arguments
+        # First binary is the primary, additional are specified via -object
+        $covArgs = @(
+            'export'
+            '-format=lcov'
+            "-instr-profile=$profdataPath"
+            '--ignore-filename-regex=\.cargo|rustc'
+        )
+
+        $covArgs += $binaries[0].FullName
+        for ($i = 1; $i -lt $binaries.Count; $i++) {
+            $covArgs += @('-object', $binaries[$i].FullName)
+        }
+
+        Write-Verbose -Verbose "Exporting LCOV report to: $OutputPath"
+        & $llvmCov @covArgs > $OutputPath 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "llvm-cov export returned exit code $LASTEXITCODE. Report may be incomplete."
+        }
+
+        if (Test-Path $OutputPath) {
+            $fileSize = (Get-Item $OutputPath).Length
+            Write-Verbose -Verbose "Code coverage report written to: $OutputPath ($fileSize bytes)"
+        } else {
+            Write-Warning "Coverage report was not generated at: $OutputPath"
+        }
+    }
+}
+
+function ConvertTo-NormalizedLcovSourcePath {
+    <#
+        .SYNOPSIS
+        Normalizes an LCOV SF: path to a relative, forward-slash path for consistent merging.
+
+        .DESCRIPTION
+        LCOV files generated on different platforms contain platform-specific absolute paths
+        (e.g., /home/runner/work/DSC/DSC/src/foo.rs on Linux, D:\a\DSC\DSC\src\foo.rs on
+        Windows). This function strips common CI workspace prefixes and normalizes path
+        separators so that the same source file is recognized across platforms when merging
+        coverage data.
+
+        .PARAMETER RawPath
+        The raw SF: path value from an LCOV file.
+
+        .OUTPUTS
+        A normalized relative path using forward slashes.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RawPath
+    )
+
+    process {
+        $normalized = $RawPath
+
+        # Normalize backslashes to forward slashes
+        $normalized = $normalized.Replace('\', '/')
+
+        # Strip common CI workspace prefixes:
+        # GitHub Actions Linux/macOS: /home/runner/work/<repo>/<repo>/ or /Users/runner/work/<repo>/<repo>/
+        # GitHub Actions Windows: D:/a/<repo>/<repo>/ (after backslash normalization)
+        $patterns = @(
+            '^/home/[^/]+/work/[^/]+/[^/]+/'     # Linux: /home/runner/work/DSC/DSC/
+            '^/Users/[^/]+/work/[^/]+/[^/]+/'     # macOS: /Users/runner/work/DSC/DSC/
+            '^[A-Za-z]:/a/[^/]+/[^/]+/'           # Windows: D:/a/DSC/DSC/
+        )
+
+        foreach ($pattern in $patterns) {
+            if ($normalized -match $pattern) {
+                $normalized = $normalized -replace $pattern, ''
+                break
+            }
+        }
+
+        # If still absolute (starts with / or a drive letter), try to find a known source
+        # directory marker and make relative from there (e.g., from the crate root)
+        if ($normalized.StartsWith('/') -or $normalized -match '^[A-Za-z]:/') {
+            # Look for common Rust project markers in the path
+            $markers = @('/src/', '/tests/', '/benches/', '/examples/')
+            foreach ($marker in $markers) {
+                $markerIdx = $normalized.IndexOf($marker)
+                if ($markerIdx -gt 0) {
+                    # Find the crate directory (one level up from src/tests/etc.)
+                    $prefix = $normalized.Substring(0, $markerIdx)
+                    $lastSlash = $prefix.LastIndexOf('/')
+                    if ($lastSlash -ge 0) {
+                        $normalized = $normalized.Substring($lastSlash + 1)
+                        break
+                    }
+                }
+            }
+        }
+
+        return $normalized
+    }
+}
+
+function Merge-LcovFile {
+    <#
+        .SYNOPSIS
+        Merges multiple LCOV files into a single consolidated report.
+
+        .DESCRIPTION
+        Reads multiple LCOV-format coverage files and merges them by combining line hit
+        counts for matching source files. When the same line appears in multiple reports,
+        the hit counts are summed.
+
+        Source file paths are normalized to relative paths before merging so that LCOV
+        files generated on different platforms (with different absolute workspace paths
+        and path separators) are correctly recognized as covering the same source files.
+
+        .PARAMETER Path
+        Array of paths to LCOV files to merge.
+
+        .PARAMETER OutputPath
+        The file path where the merged LCOV report will be written.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$OutputPath
+    )
+
+    process {
+        # Structure: $coverage[normalizedSourceFile][lineNumber] = hitCount
+        $coverage = @{}
+
+        foreach ($lcovPath in $Path) {
+            if (-not (Test-Path $lcovPath)) {
+                Write-Verbose "Skipping missing LCOV file: $lcovPath"
+                continue
+            }
+
+            $currentFile = $null
+            foreach ($line in Get-Content -Path $lcovPath) {
+                if ($line -match '^SF:(.+)$') {
+                    $currentFile = ConvertTo-NormalizedLcovSourcePath -RawPath $Matches[1]
+                    if (-not $coverage.ContainsKey($currentFile)) {
+                        $coverage[$currentFile] = @{}
+                    }
+                } elseif ($line -match '^DA:(\d+),(\d+)') {
+                    $lineNum = [int]$Matches[1]
+                    # LLVM emits sentinel values near UInt64.MaxValue for uninstrumented lines
+                    $rawHit = [decimal]$Matches[2]
+                    $hits = if ($rawHit -gt [long]::MaxValue) { [long]0 } else { [long]$rawHit }
+                    if ($currentFile -and $coverage.ContainsKey($currentFile)) {
+                        if ($coverage[$currentFile].ContainsKey($lineNum)) {
+                            $coverage[$currentFile][$lineNum] += $hits
+                        } else {
+                            $coverage[$currentFile][$lineNum] = $hits
+                        }
+                    }
+                }
+            }
+        }
+
+        # Write merged output (line-level data only; function records are omitted
+        # because merging them correctly requires aggregation logic beyond summing)
+        $output = [System.Text.StringBuilder]::new()
+        foreach ($file in $coverage.Keys | Sort-Object) {
+            [void]$output.AppendLine("SF:$file")
+            $lineCount = 0
+            $hitCount = 0
+            foreach ($lineNum in $coverage[$file].Keys | Sort-Object) {
+                $hits = $coverage[$file][$lineNum]
+                [void]$output.AppendLine("DA:$lineNum,$hits")
+                $lineCount++
+                if ($hits -gt 0) { $hitCount++ }
+            }
+            [void]$output.AppendLine("LF:$lineCount")
+            [void]$output.AppendLine("LH:$hitCount")
+            [void]$output.AppendLine('end_of_record')
+        }
+
+        Set-Content -Path $OutputPath -Value $output.ToString() -NoNewline
+        Write-Verbose -Verbose "Merged $($Path.Count) LCOV file(s) into: $OutputPath"
     }
 }
 
@@ -2077,7 +2432,7 @@ function Get-CodeCoverageReport {
             }
 
             # Parse diff to get added line numbers in the new file
-            $diffOutput = git diff "$BaseSha...$HeadSha" -- $file
+            $diffOutput = git diff "$BaseSha..$HeadSha" -- $file
             $addedLineNumbers = @()
             $currentLineNum = 0
 
@@ -2089,6 +2444,8 @@ function Get-CodeCoverageReport {
                     $currentLineNum++
                 } elseif ($diffLine.StartsWith('-') -and -not $diffLine.StartsWith('---')) {
                     # Deleted lines don't advance the new file line counter
+                } elseif ($diffLine.StartsWith('\')) {
+                    # "\ No newline at end of file" marker — not a real line
                 } else {
                     $currentLineNum++
                 }
@@ -2096,32 +2453,34 @@ function Get-CodeCoverageReport {
 
             # Find matching LCOV entry for this file
             $absPath = (Resolve-Path $file).Path
+            $normalizedFile = $file.Replace('\', '/')
             $fileCoverage = $null
             foreach ($key in $lcovData.Keys) {
-                if ($key -eq $absPath -or $key.EndsWith("/$file") -or $key.EndsWith("\$file")) {
+                $normalizedKey = $key.Replace('\', '/')
+                if ($normalizedKey -eq $absPath -or
+                    $normalizedKey -eq $normalizedFile -or
+                    $normalizedKey.EndsWith("/$normalizedFile") -or
+                    $normalizedKey.EndsWith("\$normalizedFile")) {
                     $fileCoverage = $lcovData[$key]
                     break
                 }
             }
 
+            if (-not $fileCoverage) {
+                Write-Verbose -Verbose "Skipping '$file': not in LCOV data (possibly platform-specific or not instrumented)"
+                continue
+            }
+
             # Build per-line coverage map for this file (only added executable lines)
             $lineCoverageMap = @{}
-            if ($fileCoverage) {
-                foreach ($lineNum in $addedLineNumbers) {
-                    if ($fileCoverage.ContainsKey($lineNum)) {
-                        $totalChangedLines++
-                        $isCovered = $fileCoverage[$lineNum] -gt 0
-                        if ($isCovered) {
-                            $coveredLines++
-                        }
-                        $lineCoverageMap[$lineNum] = $isCovered
+            foreach ($lineNum in $addedLineNumbers) {
+                if ($fileCoverage.ContainsKey($lineNum)) {
+                    $totalChangedLines++
+                    $isCovered = $fileCoverage[$lineNum] -gt 0
+                    if ($isCovered) {
+                        $coveredLines++
                     }
-                }
-            } else {
-                # File not in coverage report - count added lines as uncovered
-                $totalChangedLines += $addedLineNumbers.Count
-                foreach ($lineNum in $addedLineNumbers) {
-                    $lineCoverageMap[$lineNum] = $false
+                    $lineCoverageMap[$lineNum] = $isCovered
                 }
             }
 
@@ -2166,6 +2525,276 @@ function Get-CodeCoverageReport {
         }
     }
 }
+function Get-FullCodeCoverageReport {
+    <#
+        .SYNOPSIS
+        Computes overall code coverage statistics from an LCOV file across the entire codebase.
+
+        .DESCRIPTION
+        Parses an LCOV file and computes total line coverage across all source files,
+        providing a full-codebase coverage percentage regardless of what changed in a PR.
+
+        .PARAMETER LcovPath
+        Path to the LCOV coverage report file.
+
+        .OUTPUTS
+        PSCustomObject with properties: Percentage, CoveredLines, TotalLines, Emoji, Label
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$LcovPath
+    )
+
+    process {
+        if (-not (Test-Path $LcovPath)) {
+            throw "LCOV file not found at '$LcovPath'"
+        }
+
+        $totalLines = 0
+        $coveredLines = 0
+
+        foreach ($line in Get-Content -Path $LcovPath) {
+            if ($line -match '^DA:(\d+),(\d+)') {
+                $rawHit = [decimal]$Matches[2]
+                # LLVM emits sentinel values near UInt64.MaxValue for uninstrumented lines
+                $hitCount = if ($rawHit -gt [long]::MaxValue) { 0 } else { [long]$rawHit }
+                $totalLines++
+                if ($hitCount -gt 0) {
+                    $coveredLines++
+                }
+            }
+        }
+
+        if ($totalLines -eq 0) {
+            $percentage = 0
+        } else {
+            $percentage = [int][math]::Floor($coveredLines * 100 / $totalLines)
+        }
+
+        $emoji, $label = if ($percentage -ge 90) {
+            ':green_circle:', 'excellent'
+        } elseif ($percentage -ge 80) {
+            ':large_blue_circle:', 'good'
+        } elseif ($percentage -ge 70) {
+            ':yellow_circle:', 'acceptable'
+        } elseif ($percentage -ge 60) {
+            ':orange_circle:', 'needs improvement'
+        } else {
+            ':red_circle:', 'low'
+        }
+
+        Write-Verbose -Verbose "Full codebase coverage: $percentage% ($coveredLines/$totalLines lines)"
+
+        [PSCustomObject]@{
+            Percentage   = $percentage
+            CoveredLines = $coveredLines
+            TotalLines   = $totalLines
+            Emoji        = $emoji
+            Label        = $label
+        }
+    }
+}
+
+function Get-FullCodeCoverageDetail {
+    <#
+        .SYNOPSIS
+        Parses an LCOV file and returns per-file coverage details for the entire codebase.
+
+        .DESCRIPTION
+        Reads an LCOV coverage report and returns an array of objects, one per source file,
+        containing the file path, coverage percentage, line counts, and a map of uncovered
+        line numbers. This enables file-by-file and line-by-line coverage inspection.
+
+        .PARAMETER LcovPath
+        Path to the LCOV coverage report file.
+
+        .PARAMETER MinimumLines
+        Minimum number of executable lines a file must have to be included in output.
+        Defaults to 1 (include all files with any instrumented lines).
+
+        .OUTPUTS
+        Array of PSCustomObject with: File, Percentage, CoveredLines, TotalLines, UncoveredLines
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$LcovPath,
+
+        [Parameter()]
+        [int]$MinimumLines = 1
+    )
+
+    process {
+        if (-not (Test-Path $LcovPath)) {
+            throw "LCOV file not found at '$LcovPath'"
+        }
+
+        $fileData = @{}
+        $currentFile = $null
+
+        foreach ($line in Get-Content -Path $LcovPath) {
+            if ($line -match '^SF:(.+)$') {
+                $currentFile = $Matches[1]
+                $fileData[$currentFile] = @{ Lines = @{} }
+            } elseif ($line -match '^DA:(\d+),(\d+)' -and $currentFile) {
+                $lineNum = [int]$Matches[1]
+                $rawHit = [decimal]$Matches[2]
+                $hitCount = if ($rawHit -gt [long]::MaxValue) { [long]0 } else { [long]$rawHit }
+                $fileData[$currentFile].Lines[$lineNum] = $hitCount
+            } elseif ($line -eq 'end_of_record') {
+                $currentFile = $null
+            }
+        }
+
+        $results = foreach ($file in $fileData.Keys | Sort-Object) {
+            $lines = $fileData[$file].Lines
+            $total = $lines.Count
+            if ($total -lt $MinimumLines) {
+                continue
+            }
+            $covered = ($lines.Values | Where-Object { $_ -gt 0 }).Count
+            $uncovered = @($lines.GetEnumerator() | Where-Object { $_.Value -eq 0 } |
+                ForEach-Object { $_.Key } | Sort-Object)
+            $pct = if ($total -eq 0) { 0 } else { [int][math]::Floor($covered * 100 / $total) }
+
+            [PSCustomObject]@{
+                File           = $file
+                Percentage     = $pct
+                CoveredLines   = $covered
+                TotalLines     = $total
+                UncoveredLines = $uncovered
+            }
+        }
+
+        $results
+    }
+}
+
+function Show-FullCodeCoverageReport {
+    <#
+        .SYNOPSIS
+        Displays a colorized file-by-file coverage summary with optional line-level detail.
+
+        .DESCRIPTION
+        Shows a table of all source files with their coverage percentage, sorted by coverage
+        (lowest first). When ShowUncoveredLines is specified, also displays the uncovered
+        line numbers and source text for files below the threshold.
+
+        .PARAMETER LcovPath
+        Path to the LCOV coverage report file.
+
+        .PARAMETER ShowUncoveredLines
+        When specified, displays uncovered line numbers and source for files below the
+        coverage threshold specified by UncoveredThreshold.
+
+        .PARAMETER UncoveredThreshold
+        Files with coverage percentage at or below this value will have their uncovered lines
+        displayed when ShowUncoveredLines is set. Defaults to 80.
+
+        .PARAMETER Top
+        Maximum number of files to display in the summary. Defaults to showing all files.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$LcovPath,
+
+        [Parameter()]
+        [switch]$ShowUncoveredLines,
+
+        [Parameter()]
+        [int]$UncoveredThreshold = 80,
+
+        [Parameter()]
+        [int]$Top = 0
+    )
+
+    process {
+        $details = Get-FullCodeCoverageDetail -LcovPath $LcovPath
+
+        if (-not $details -or $details.Count -eq 0) {
+            Write-Host "No coverage data available."
+            return
+        }
+
+        # Sort by percentage ascending (worst coverage first)
+        $sorted = $details | Sort-Object Percentage
+
+        if ($Top -gt 0) {
+            $sorted = $sorted | Select-Object -First $Top
+        }
+
+        # Display summary table
+        Write-Host ""
+        Write-Host "$($PSStyle.Bold)File Coverage Summary (sorted by coverage, lowest first):$($PSStyle.BoldOff)"
+        Write-Host ""
+
+        $maxPathLen = ($sorted | ForEach-Object {
+            # Show relative path from repo root for readability
+            $_.File.Length
+        } | Measure-Object -Maximum).Maximum
+        $maxPathLen = [Math]::Min($maxPathLen, 80)
+
+        foreach ($entry in $sorted) {
+            $displayPath = $entry.File
+            if ($displayPath.Length -gt $maxPathLen) {
+                $displayPath = '...' + $displayPath.Substring($displayPath.Length - $maxPathLen + 3)
+            }
+
+            $color = if ($entry.Percentage -ge 80) {
+                $PSStyle.Foreground.Green
+            } elseif ($entry.Percentage -ge 60) {
+                $PSStyle.Foreground.Yellow
+            } else {
+                $PSStyle.Foreground.Red
+            }
+
+            $bar = $entry.Percentage.ToString().PadLeft(3)
+            Write-Host "${color}  ${bar}%$($PSStyle.Reset)  $($entry.CoveredLines.ToString().PadLeft(5))/$($entry.TotalLines.ToString().PadLeft(5))  $displayPath"
+        }
+
+        Write-Host ""
+        $totalFiles = $details.Count
+        $filesBelow = ($details | Where-Object { $_.Percentage -lt 70 }).Count
+        Write-Host "  $totalFiles files total | $filesBelow files below 70% coverage"
+
+        # Show uncovered lines for low-coverage files
+        if ($ShowUncoveredLines) {
+            $lowCovFiles = $sorted | Where-Object { $_.Percentage -le $UncoveredThreshold }
+            if ($lowCovFiles.Count -eq 0) {
+                Write-Host ""
+                Write-Host "All displayed files are above $UncoveredThreshold% coverage."
+                return
+            }
+
+            Write-Host ""
+            Write-Host "$($PSStyle.Bold)Uncovered lines (files at or below ${UncoveredThreshold}% coverage):$($PSStyle.BoldOff)"
+
+            foreach ($entry in $lowCovFiles) {
+                $filePath = $entry.File
+                $fileContent = Get-Content -Path $filePath -ErrorAction SilentlyContinue
+
+                Write-Host ""
+                Write-Host "$($PSStyle.Bold)$filePath$($PSStyle.BoldOff) ($($entry.Percentage)%)" -ForegroundColor Cyan
+
+                if (-not $fileContent -or $entry.UncoveredLines.Count -eq 0) {
+                    continue
+                }
+
+                $lineNumWidth = ($entry.UncoveredLines[-1]).ToString().Length
+                foreach ($lineNum in $entry.UncoveredLines) {
+                    $lineIndex = $lineNum - 1
+                    $lineText = if ($lineIndex -lt $fileContent.Count) { $fileContent[$lineIndex] } else { '' }
+                    $prefix = $lineNum.ToString().PadLeft($lineNumWidth)
+                    Write-Host "$($PSStyle.Foreground.Red)  $prefix | $lineText$($PSStyle.Reset)"
+                }
+            }
+            Write-Host ""
+        }
+    }
+}
+
 #endregion Code coverage functions
 
 #region    Test project functions
@@ -2177,8 +2806,7 @@ function Test-RustProject {
         $Architecture = 'current',
         [switch]$Release,
         [switch]$Docs,
-        [string]$TestFilter,
-        [switch]$CodeCoverage
+        [string]$TestFilter
     )
 
     begin {
@@ -2208,18 +2836,10 @@ function Test-RustProject {
         } else {
             Write-Verbose -Verbose "Testing rust projects: [$members]"
         }
-        if ($CodeCoverage) {
-            if (-not [string]::IsNullOrEmpty($TestFilter)) {
-                cargo llvm-cov test --no-report @flags -- $TestFilter
-            } else {
-                cargo llvm-cov test --no-report @flags
-            }
+        if (-not [string]::IsNullOrEmpty($TestFilter)) {
+            cargo test @flags -- $TestFilter
         } else {
-            if (-not [string]::IsNullOrEmpty($TestFilter)) {
-                cargo test @flags -- $TestFilter
-            } else {
-                cargo test @flags
-            }
+            cargo test @flags
         }
 
         if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {

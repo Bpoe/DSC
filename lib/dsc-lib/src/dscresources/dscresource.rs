@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::{configure::{Configurator, config_doc::{Configuration, ExecutionKind, Resource}, context::ProcessMode, parameters::{SECURE_VALUE_REDACTED, is_secure_value}}, dscresources::resource_manifest::{AdapterInputKind, Kind}, types::{FullyQualifiedTypeName, ResourceVersion}};
+use crate::{configure::{Configurator, config_doc::{Configuration, ExecutionKind, Resource}, context::ProcessMode, parameters::{SECURE_VALUE_REDACTED, is_secure_value}, schema_cache::get_resource_schema}, dscresources::{adapted_resource_manifest::AdaptedDscResourceManifest, resource_manifest::{AdapterInputKind, Kind}}, types::{FullyQualifiedTypeName, ResourceVersion}};
 use crate::discovery::discovery_trait::DiscoveryFilter;
 use crate::dscresources::invoke_result::{ResourceGetResponse, ResourceSetResponse};
 use crate::schemas::transforms::idiomaticize_string_enum;
@@ -11,7 +11,8 @@ use rust_i18n::t;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
 use std::path::PathBuf;
 use tracing::{debug, info, trace, warn};
 
@@ -29,6 +30,10 @@ use super::{
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 #[dsc_repo_schema(base_name = "list", folder_path = "outputs/resource")]
+#[schemars(
+    transform = DscResource::transform_export_schema_uris,
+    transform = DscResource::transform_schema_docs
+)]
 pub struct DscResource {
     /// The namespaced name of the resource.
     #[serde(rename="type")]
@@ -61,14 +66,40 @@ pub struct DscResource {
     pub target_resource: Option<Box<DscResource>>,
     /// The manifest of the resource.
     pub manifest: Option<ResourceManifest>,
+    /// The adapted manifest of the resource, if available.
+    pub adapted_manifest: Option<AdaptedDscResourceManifest>,
     /// The content of the adapted resource, if available.
     pub adapted_content: Option<Map<String, Value>>,
 }
 
+pub(crate) enum Operation {
+    Get,
+    Set,
+    Test,
+    Delete,
+    Export,
+}
+
+impl Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Operation::Get => write!(f, "get"),
+            Operation::Set => write!(f, "set"),
+            Operation::Test => write!(f, "test"),
+            Operation::Delete => write!(f, "delete"),
+            Operation::Export => write!(f, "export"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema, Ord, PartialOrd)]
 #[serde(rename_all = "camelCase")]
-#[schemars(transform = idiomaticize_string_enum)]
 #[dsc_repo_schema(base_name = "resourceCapabilities", folder_path = "definitions")]
+#[schemars(
+    transform = idiomaticize_string_enum,
+    transform = Capability::transform_export_schema_uris,
+    transform = Capability::transform_schema_docs
+)]
 pub enum Capability {
     /// The resource supports retrieving configuration.
     Get,
@@ -92,6 +123,7 @@ pub enum Capability {
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
+#[schemars(inline)]
 pub enum ImplementedAs {
     /// A command line executable
     Command,
@@ -118,6 +150,7 @@ impl DscResource {
             schema: None,
             target_resource: None,
             manifest: None,
+            adapted_manifest: None,
             adapted_content: None,
         }
     }
@@ -269,7 +302,7 @@ impl DscResource {
         let mut export_result = ExportResult {
             actual_state: Vec::new(),
         };
-        debug!("Export result: {}", serde_json::to_string(&configuration)?);
+        debug!("{}", t!("dscresources.dscresource.exportResult", result = serde_json::to_string(&configuration)?));
         for resource in configuration.resources {
             let Some(properties) = resource.properties else {
                 return Err(DscError::Operation(t!("dscresources.dscresource.invokeExportReturnedNoResult", resource = self.type_name).to_string()));
@@ -470,7 +503,12 @@ impl Invoke for DscResource {
                             response.actual_state
                         }
                     };
-                    let diff_properties = get_diff( &desired_state, &actual_state);
+                    let schema: Option<Value> = if let Some(s) = &self.schema {
+                        serde_json::to_value(s).ok()
+                    } else {
+                        self.schema().ok().and_then(|s| serde_json::from_str(&s).ok())
+                    };
+                    let diff_properties = get_diff_with_schema( &desired_state, &actual_state, schema.as_ref());
                     desired_state = redact(&desired_state);
                     let test_result = TestResult::Resource(ResourceTestResponse {
                         desired_state,
@@ -529,6 +567,12 @@ impl Invoke for DscResource {
     }
 
     fn schema(&self) -> Result<String, DscError> {
+        let target_resource = self.target_resource.as_deref().unwrap_or(self);
+        if let Some(schema) = get_resource_schema(&target_resource.type_name, &target_resource.version) {
+            debug!("{}", t!("dscresources.dscresource.retrievedSchemaFromCache", resource = target_resource.type_name, version = target_resource.version));
+            return Ok(serde_json::to_string(&schema)?);
+        }
+
         debug!("{}", t!("dscresources.dscresource.invokeSchema", resource = self.type_name));
         if let Some(deprecation_message) = self.deprecation_message.as_ref() {
             warn!("{}", t!("dscresources.dscresource.deprecationMessage", resource = self.type_name, message = deprecation_message));
@@ -641,6 +685,25 @@ pub fn get_adapter_input_kind(adapter: &DscResource) -> Result<AdapterInputKind,
 ///
 /// An array of top level properties that differ, if any
 pub fn get_diff(expected: &Value, actual: &Value) -> Vec<String> {
+    get_diff_with_schema(expected, actual, None)
+}
+
+#[must_use]
+/// Performs a comparison of two JSON Values using an optional JSON Schema.
+/// Properties whose schema sets `writeOnly` to `true` are ignored. If a property exists
+/// in `expected` but not in `actual`, the schema's `default` value for that property is
+/// used for comparison when available.
+///
+/// # Arguments
+///
+/// * `expected` - The expected value
+/// * `actual` - The actual value
+/// * `schema` - Optional JSON Schema to identify write-only properties and default values
+///
+/// # Returns
+///
+/// An array of top level properties that differ, if any
+pub(crate) fn get_diff_with_schema(expected: &Value, actual: &Value, schema: Option<&Value>) -> Vec<String> {
     let mut diff_properties: Vec<String> = Vec::new();
     if expected.is_null() {
         return diff_properties;
@@ -662,13 +725,40 @@ pub fn get_diff(expected: &Value, actual: &Value) -> Vec<String> {
         }
 
         for (key, value) in &*map {
+            if is_schema_write_only(schema, key) {
+                continue;
+            }
+
             if is_secure_value(value) {
                 // skip secure values as they are not comparable
                 continue;
             }
 
             if value.is_object() {
-                let sub_diff = get_diff(value, &actual[key]);
+                // When comparing nested objects, pass the corresponding nested schema so that
+                // nested `writeOnly` properties and nested defaults are handled correctly.
+                let sub_schema = schema.and_then(|schema| {
+                    let mut property_schema = schema
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .and_then(|properties| properties.get(key))?;
+                    // Resolve local refs so nested comparisons can still see `properties`, `default`, and `writeOnly`.
+                    let mut visited_references = HashSet::<String>::new();
+                    while let Some(reference) = property_schema.get("$ref").and_then(Value::as_str) {
+                        let Some(pointer) = reference.strip_prefix('#') else {
+                            break;
+                        };
+                        if !visited_references.insert(pointer.to_string()) {
+                            break;
+                        }
+                        let Some(resolved_schema) = schema.pointer(pointer) else {
+                            break;
+                        };
+                        property_schema = resolved_schema;
+                    }
+                    Some(property_schema)
+                });
+                let sub_diff = get_diff_with_schema(value, &actual[key], sub_schema);
                 if !sub_diff.is_empty() {
                     debug!("{}", t!("dscresources.dscresource.subDiff", key = key));
                     diff_properties.push(key.to_string());
@@ -696,8 +786,16 @@ pub fn get_diff(expected: &Value, actual: &Value) -> Vec<String> {
                             diff_properties.push(key.to_string());
                         }
                     } else {
-                        info!("{}", t!("dscresources.dscresource.diffKeyMissing", key = key));
-                        diff_properties.push(key.to_string());
+                        // Property not in actual - check schema for a default value
+                        if let Some(default_value) = get_schema_default(schema, key) {
+                            if value != &default_value {
+                                info!("{}", t!("dscresources.dscresource.diffKeyMissing", key = key));
+                                diff_properties.push(key.to_string());
+                            }
+                        } else {
+                            info!("{}", t!("dscresources.dscresource.diffKeyMissing", key = key));
+                            diff_properties.push(key.to_string());
+                        }
                     }
                 } else {
                     info!("{}", t!("dscresources.dscresource.diffKeyNotObject", key = key));
@@ -708,6 +806,59 @@ pub fn get_diff(expected: &Value, actual: &Value) -> Vec<String> {
     }
 
     diff_properties
+}
+
+/// Looks up the default value for a property from a JSON Schema.
+///
+/// # Arguments
+///
+/// * `schema` - Optional JSON Schema value
+/// * `property_name` - The property name to look up
+///
+/// # Returns
+///
+/// The default value if found in the schema's properties definition, otherwise None
+fn get_schema_default(schema: Option<&Value>, property_name: &str) -> Option<Value> {
+    let schema = schema?;
+    let properties = schema.get("properties")?.as_object()?;
+    let property_schema = properties.get(property_name)?.as_object()?;
+    property_schema.get("default").cloned()
+}
+
+/// Returns whether a property's JSON Schema sets `writeOnly` to `true`, directly or
+/// through a local JSON Pointer reference.
+fn is_schema_write_only(schema: Option<&Value>, property_name: &str) -> bool {
+    let Some(schema) = schema else {
+        return false;
+    };
+    let Some(mut property_schema) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(property_name))
+    else {
+        return false;
+    };
+    let mut visited_references = HashSet::new();
+
+    loop {
+        if property_schema.get("writeOnly").and_then(Value::as_bool) == Some(true) {
+            return true;
+        }
+
+        let Some(reference) = property_schema.get("$ref").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(pointer) = reference.strip_prefix('#') else {
+            return false;
+        };
+        if !visited_references.insert(pointer) {
+            return false;
+        }
+        let Some(resolved_schema) = schema.pointer(pointer) else {
+            return false;
+        };
+        property_schema = resolved_schema;
+    }
 }
 
 /// Validates the properties of a resource against its schema.
@@ -771,8 +922,8 @@ pub fn validate_properties(resource: &DscResource, properties: &Value) -> Result
 /// * `DscError` - The JSON is invalid
 pub fn validate_json(source: &str, schema: &Value, json: &Value) -> Result<(), DscError> {
     debug!("{}: {source}", t!("dscresources.dscresource.validatingSchema"));
-    trace!("JSON: {json}");
-    trace!("Schema: {schema}");
+    trace!("{}", t!("dscresources.dscresource.json", json = json));
+    trace!("{}", t!("dscresources.dscresource.schema", schema = schema));
     let compiled_schema = match Validator::new(schema) {
         Ok(compiled_schema) => compiled_schema,
         Err(err) => {
@@ -919,4 +1070,193 @@ fn different_array_with_nested_array() {
     let array_one = vec![json!("a"), json!(1), json!({"a":"b"}), json!(vec![json!("a"), json!(1)])];
     let array_two = vec![json!("a"), json!(1), json!({"a":"b"}), json!(vec![json!("a"), json!(2)])];
     assert_eq!(is_same_array(&array_one, &array_two), false);
+}
+
+#[test]
+fn diff_with_schema_default_matches_expected() {
+    use serde_json::json;
+    let expected = json!({"name": "test", "enabled": true});
+    let actual = json!({"name": "test"});
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "enabled": { "type": "boolean", "default": true }
+        }
+    });
+    let diff = get_diff_with_schema(&expected, &actual, Some(&schema));
+    assert!(diff.is_empty(), "Expected no diff when expected matches schema default, got: {diff:?}");
+}
+
+#[test]
+fn diff_with_schema_default_differs_from_expected() {
+    use serde_json::json;
+    let expected = json!({"name": "test", "enabled": false});
+    let actual = json!({"name": "test"});
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "enabled": { "type": "boolean", "default": true }
+        }
+    });
+    let diff = get_diff_with_schema(&expected, &actual, Some(&schema));
+    assert_eq!(diff, vec!["enabled".to_string()]);
+}
+
+#[test]
+fn diff_with_schema_no_default_reports_missing_property() {
+    use serde_json::json;
+    let expected = json!({"name": "test", "enabled": true});
+    let actual = json!({"name": "test"});
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "enabled": { "type": "boolean" }
+        }
+    });
+    let diff = get_diff_with_schema(&expected, &actual, Some(&schema));
+    assert_eq!(diff, vec!["enabled".to_string()]);
+}
+
+#[test]
+fn diff_with_schema_write_only_ignores_differing_property() {
+    use serde_json::json;
+    let expected = json!({"name": "test", "action": "remove"});
+    let actual = json!({"name": "test", "action": "ignore"});
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "action": { "type": "string", "writeOnly": true }
+        }
+    });
+    let diff = get_diff_with_schema(&expected, &actual, Some(&schema));
+    assert!(diff.is_empty(), "Expected write-only property to be ignored, got: {diff:?}");
+}
+
+#[test]
+fn diff_with_schema_write_only_ignores_missing_property() {
+    use serde_json::json;
+    let expected = json!({"name": "test", "action": "remove"});
+    let actual = json!({"name": "test"});
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "action": { "type": "string", "writeOnly": true }
+        }
+    });
+    let diff = get_diff_with_schema(&expected, &actual, Some(&schema));
+    assert!(diff.is_empty(), "Expected write-only property to be ignored, got: {diff:?}");
+}
+
+#[test]
+fn diff_with_schema_write_only_local_ref_ignores_missing_property() {
+    use serde_json::json;
+    let expected = json!({"name": "test", "action": "remove"});
+    let actual = json!({"name": "test"});
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "action": { "$ref": "#/$defs/action" }
+        },
+        "$defs": {
+            "action": { "type": "string", "writeOnly": true }
+        }
+    });
+    let diff = get_diff_with_schema(&expected, &actual, Some(&schema));
+    assert!(diff.is_empty(), "Expected referenced write-only property to be ignored, got: {diff:?}");
+}
+
+#[test]
+fn diff_with_schema_nested_external_ref_falls_back_to_normal_comparison() {
+    use serde_json::json;
+    let expected = json!({"nested": {"value": "expected"}});
+    let actual = json!({"nested": {"value": "actual"}});
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "nested": { "$ref": "https://example.com/nested.schema.json" }
+        }
+    });
+    let diff = get_diff_with_schema(&expected, &actual, Some(&schema));
+    assert_eq!(diff, vec!["nested".to_string()]);
+}
+
+#[test]
+fn diff_with_schema_nested_cyclic_ref_falls_back_to_normal_comparison() {
+    use serde_json::json;
+    let expected = json!({"nested": {"value": "expected"}});
+    let actual = json!({"nested": {"value": "actual"}});
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "nested": { "$ref": "#/$defs/first" }
+        },
+        "$defs": {
+            "first": { "$ref": "#/$defs/second" },
+            "second": { "$ref": "#/$defs/first" }
+        }
+    });
+    let diff = get_diff_with_schema(&expected, &actual, Some(&schema));
+    assert_eq!(diff, vec!["nested".to_string()]);
+}
+
+#[test]
+fn diff_with_schema_nested_missing_ref_falls_back_to_normal_comparison() {
+    use serde_json::json;
+    let expected = json!({"nested": {"value": "expected"}});
+    let actual = json!({"nested": {"value": "actual"}});
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "nested": { "$ref": "#/$defs/missing" }
+        }
+    });
+    let diff = get_diff_with_schema(&expected, &actual, Some(&schema));
+    assert_eq!(diff, vec!["nested".to_string()]);
+}
+
+#[test]
+fn diff_with_schema_write_only_false_reports_missing_property() {
+    use serde_json::json;
+    let expected = json!({"name": "test", "action": "remove"});
+    let actual = json!({"name": "test"});
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "action": { "type": "string", "writeOnly": false }
+        }
+    });
+    let diff = get_diff_with_schema(&expected, &actual, Some(&schema));
+    assert_eq!(diff, vec!["action".to_string()]);
+}
+
+#[test]
+fn diff_without_schema_reports_missing_property() {
+    use serde_json::json;
+    let expected = json!({"name": "test", "enabled": true});
+    let actual = json!({"name": "test"});
+    let diff = get_diff_with_schema(&expected, &actual, None);
+    assert_eq!(diff, vec!["enabled".to_string()]);
+}
+
+#[test]
+fn diff_with_schema_default_integer() {
+    use serde_json::json;
+    let expected = json!({"name": "test", "count": 5});
+    let actual = json!({"name": "test"});
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "count": { "type": "integer", "default": 5 }
+        }
+    });
+    let diff = get_diff_with_schema(&expected, &actual, Some(&schema));
+    assert!(diff.is_empty(), "Expected no diff when expected matches schema default integer, got: {diff:?}");
 }

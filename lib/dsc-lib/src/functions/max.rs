@@ -16,6 +16,8 @@ impl Function for Max {
         FunctionMetadata {
             name: "max".to_string(),
             description: t!("functions.max.description").to_string(),
+            syntax: t!("functions.max.syntax").to_string(),
+            constraints: None,
             category: vec![FunctionCategory::Numeric],
             min_args: 1,
             max_args: usize::MAX,
@@ -26,7 +28,7 @@ impl Function for Max {
     }
 
     fn invoke(&self, args: &[Value], _context: &Context) -> Result<Value, DscError> {
-        debug!("max function");
+        debug!("{}", t!("functions.max.invoked"));
         if args.len() == 1 {
             if let Some(array) = args[0].as_array() {
                 find_max(array)

@@ -1,6 +1,6 @@
 [package]
 name = "dsc"
-version = "3.3.0-preview.3"
+version = "3.4.0-preview.1"
 edition = "2024"
 
 [dependencies]
@@ -37,3 +37,4 @@ tracing-subscriber = { workspace = true }
 tracing-indicatif = { workspace = true }
 # workspace crate dependencies
 dsc-lib = { workspace = true }
+dsc-lib-telemetry = { workspace = true }

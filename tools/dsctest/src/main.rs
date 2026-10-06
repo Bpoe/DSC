@@ -16,6 +16,8 @@ mod operation;
 mod adapter;
 mod refresh_env;
 mod restart_required;
+mod schema_default;
+mod set;
 mod sleep;
 mod state_and_diff;
 mod trace;
@@ -40,6 +42,8 @@ use crate::metadata::Metadata;
 use crate::operation::Operation;
 use crate::refresh_env::RefreshEnv;
 use crate::restart_required::RestartRequired;
+use crate::schema_default::SchemaDefault;
+use crate::set::{Set, invoke_set};
 use crate::sleep::Sleep;
 use crate::state_and_diff::StateAndDiff;
 use crate::trace::Trace;
@@ -52,8 +56,8 @@ use std::{thread, time::Duration};
 fn main() {
     let args = Args::parse();
     let json = match args.subcommand {
-        SubCommand::Adapter { input , resource_type, resource_path, operation } => {
-            match adapter::adapt(&resource_type, &input, &operation, &resource_path) {
+        SubCommand::Adapter { input , resource_type, resource_path, resource_version, operation } => {
+            match adapter::adapt(&resource_type, &input, &operation, &resource_path, &resource_version) {
                 Ok(result) => result,
                 Err(err) => {
                     eprintln!("Error adapting resource: {err}");
@@ -127,6 +131,7 @@ fn main() {
             for i in 0..export.count {
                 let instance = Export {
                     count: i,
+                    name: Some(format!("Instance{i}")),
                     _name: Some("TestName".to_string()),
                     _security_context: Some("elevated".to_string()),
                 };
@@ -285,6 +290,23 @@ fn main() {
             };
             serde_json::to_string(&restart_required).unwrap()
         },
+        SubCommand::SchemaDefault { input } => {
+            let schema_default = match serde_json::from_str::<SchemaDefault>(&input) {
+                Ok(sd) => sd,
+                Err(err) => {
+                    eprintln!("Error JSON does not match schema: {err}");
+                    std::process::exit(1);
+                }
+            };
+            let mut actual = serde_json::json!({"name": schema_default.name});
+            if schema_default.nested.is_some() {
+                actual["nested"] = serde_json::json!({"value": "actual"});
+            }
+            if schema_default.referenced_nested.is_some() {
+                actual["referencedNested"] = serde_json::json!({"value": "actual"});
+            }
+            actual.to_string()
+        },
         SubCommand::Schema { subcommand } => {
             let schema = match subcommand {
                 Schemas::Adapter => {
@@ -332,6 +354,12 @@ fn main() {
                 Schemas::RestartRequired => {
                     schema_for!(RestartRequired)
                 },
+                Schemas::SchemaDefault => {
+                    schema_for!(SchemaDefault)
+                },
+                Schemas::Set => {
+                    schema_for!(Set)
+                },
                 Schemas::Sleep => {
                     schema_for!(Sleep)
                 },
@@ -352,6 +380,9 @@ fn main() {
                 }
             };
             serde_json::to_string(&schema).unwrap()
+        },
+        SubCommand::Set { get, input } => {
+            invoke_set( get, input )
         },
         SubCommand::Sleep { input } => {
             let sleep = match serde_json::from_str::<Sleep>(&input) {

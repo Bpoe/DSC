@@ -20,6 +20,8 @@ pub enum Schemas {
     Operation,
     RefreshEnv,
     RestartRequired,
+    SchemaDefault,
+    Set,
     Sleep,
     StateAndDiff,
     Trace,
@@ -40,6 +42,7 @@ pub struct Args {
 pub enum AdapterOperation {
     Get,
     Set,
+    Delete,
     Test,
     List,
     Export,
@@ -63,6 +66,8 @@ pub enum SubCommand {
         resource_type: String,
         #[clap(name = "resource-path", long, help = "The path to the adapted resource")]
         resource_path: Option<String>,
+        #[clap(name = "resource-version", long, help = "The version of the adapted resource")]
+        resource_version: Option<String>,
         #[clap(name = "operation", short, long, help = "The operation to perform")]
         operation: AdapterOperation,
     },
@@ -154,10 +159,24 @@ pub enum SubCommand {
         input: String,
     },
 
+    #[clap(name = "schema-default", about = "Test resource for schema default values in synthetic test")]
+    SchemaDefault {
+        #[clap(name = "input", short, long, help = "The input to the schema-default command as JSON")]
+        input: String,
+    },
+
     #[clap(name = "schema", about = "Get the JSON schema for a subcommand")]
     Schema {
         #[clap(name = "subcommand", short, long, help = "The subcommand to get the schema for")]
         subcommand: Schemas,
+    },
+
+    #[clap(name = "set", about = "Set a resource")]
+    Set {
+        #[clap(name = "get", short, long, help = "Get the current state of the resource before setting it")]
+        get: bool,
+        #[clap(name = "input", short, long, help = "The input to the set command as JSON")]
+        input: Option<String>,
     },
 
     #[clap(name = "sleep", about = "Sleep for a specified number of seconds")]

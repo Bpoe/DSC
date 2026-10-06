@@ -14,6 +14,10 @@ use crate::types::{ExitCodesMap, FullyQualifiedTypeName, SemanticVersion, TagLis
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[schemars(
+    transform = ExtensionManifest::transform_export_schema_uris,
+    transform = ExtensionManifest::transform_schema_docs
+)]
 #[dsc_repo_schema(
     base_name = "manifest",
     folder_path = "extension",
@@ -99,7 +103,7 @@ pub fn validate_semver(version: &str) -> Result<(), semver::Error> {
 
 #[cfg(test)]
 mod test {
-    use crate::schemas::dsc_repo::{DscRepoSchema, UnrecognizedSchemaUri};
+    use crate::schemas::dsc_repo::{DscRepoSchema, UnrecognizedSchemaUriError};
 
     use crate::extensions::extension_manifest::ExtensionManifest;
 
@@ -119,7 +123,7 @@ mod test {
         assert!(result.as_ref().is_err());
 
         match result.as_ref().unwrap_err() {
-            UnrecognizedSchemaUri(actual, recognized) => {
+            UnrecognizedSchemaUriError(actual, recognized) => {
                 assert_eq!(actual, &invalid_uri);
                 assert_eq!(recognized, &ExtensionManifest::recognized_schema_uris())
             },

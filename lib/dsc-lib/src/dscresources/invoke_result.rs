@@ -11,6 +11,10 @@ use crate::schemas::dsc_repo::DscRepoSchema;
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
 #[serde(untagged)]
 #[dsc_repo_schema(base_name = "get", folder_path = "outputs/resource")]
+#[schemars(
+    transform = GetResult::transform_export_schema_uris,
+    transform = GetResult::transform_schema_docs
+)]
 pub enum GetResult {
     Resource(ResourceGetResponse),
     Group(Vec<ResourceGetResult>),
@@ -38,6 +42,10 @@ impl From<TestResult> for GetResult {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
 #[serde(deny_unknown_fields)]
 #[dsc_repo_schema(base_name = "get.simple", folder_path = "outputs/resource")]
+#[schemars(
+    transform = ResourceGetResponse::transform_export_schema_uris,
+    transform = ResourceGetResponse::transform_schema_docs
+)]
 pub struct ResourceGetResponse {
     /// The state of the resource as it was returned by the Get method.
     #[serde(rename = "actualState")]
@@ -47,6 +55,10 @@ pub struct ResourceGetResponse {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
 #[serde(untagged)]
 #[dsc_repo_schema(base_name = "set", folder_path = "outputs/resource")]
+#[schemars(
+    transform = SetResult::transform_export_schema_uris,
+    transform = SetResult::transform_schema_docs
+)]
 pub enum SetResult {
     Resource(ResourceSetResponse),
     Group(Vec<ResourceSetResult>),
@@ -73,9 +85,36 @@ impl From<TestResult> for SetResult {
     }
 }
 
+impl SetResult {
+    #[must_use]
+    pub fn is_changed(&self) -> bool {
+        match self {
+            SetResult::Resource(resource_set_result) => {
+                if let Some(changed_properties) = &resource_set_result.changed_properties {
+                    !changed_properties.is_empty()
+                } else {
+                    false
+                }
+            },
+            SetResult::Group(group_set_result) => {
+                for result in group_set_result {
+                    if result.result.is_changed() {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
 #[serde(deny_unknown_fields)]
 #[dsc_repo_schema(base_name = "set.simple", folder_path = "outputs/resource")]
+#[schemars(
+    transform = ResourceSetResponse::transform_export_schema_uris,
+    transform = ResourceSetResponse::transform_schema_docs
+)]
 pub struct ResourceSetResponse {
     /// The state of the resource as it was before the Set method was called.
     #[serde(rename = "beforeState")]
@@ -91,6 +130,10 @@ pub struct ResourceSetResponse {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
 #[serde(untagged)]
 #[dsc_repo_schema(base_name = "test", folder_path = "outputs/resource")]
+#[schemars(
+    transform = TestResult::transform_export_schema_uris,
+    transform = TestResult::transform_schema_docs
+)]
 pub enum TestResult {
     Resource(ResourceTestResponse),
     Group(Vec<ResourceTestResult>),
@@ -116,6 +159,10 @@ pub fn get_in_desired_state(test_result: &TestResult) -> bool {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
 #[serde(deny_unknown_fields)]
 #[dsc_repo_schema(base_name = "test.simple", folder_path = "outputs/resource")]
+#[schemars(
+    transform = ResourceTestResponse::transform_export_schema_uris,
+    transform = ResourceTestResponse::transform_schema_docs
+)]
 pub struct ResourceTestResponse {
     /// The state of the resource as it was expected to be.
     #[serde(rename = "desiredState")]
@@ -134,6 +181,10 @@ pub struct ResourceTestResponse {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
 #[serde(deny_unknown_fields)]
 #[dsc_repo_schema(base_name = "validate", folder_path = "outputs/resource")]
+#[schemars(
+    transform = ValidateResult::transform_export_schema_uris,
+    transform = ValidateResult::transform_schema_docs
+)]
 pub struct ValidateResult {
     /// Whether the supplied configuration is valid.
     pub valid: bool,
@@ -144,6 +195,10 @@ pub struct ValidateResult {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
 #[serde(deny_unknown_fields)]
 #[dsc_repo_schema(base_name = "export", folder_path = "outputs/resource")]
+#[schemars(
+    transform = ExportResult::transform_export_schema_uris,
+    transform = ExportResult::transform_schema_docs
+)]
 pub struct ExportResult {
     /// The state of the resource as it was returned by the Export method.
     #[serde(rename = "actualState")]
@@ -153,6 +208,10 @@ pub struct ExportResult {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
 #[serde(deny_unknown_fields)]
 #[dsc_repo_schema(base_name = "resolve", folder_path = "outputs/resource")]
+#[schemars(
+    transform = ResolveResult::transform_export_schema_uris,
+    transform = ResolveResult::transform_schema_docs
+)]
 pub struct ResolveResult {
     /// The resolved configuration.
     pub configuration: Value,
@@ -161,8 +220,11 @@ pub struct ResolveResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
-#[serde(deny_unknown_fields)]
 #[dsc_repo_schema(base_name = "delete", folder_path = "outputs/resource")]
+#[schemars(
+    transform = DeleteResult::transform_export_schema_uris,
+    transform = DeleteResult::transform_schema_docs
+)]
 pub struct DeleteResult {
     /// The return from the resource by the Delete method with what-if simulation.
     #[serde(rename = "_metadata", skip_serializing_if = "Option::is_none")]
@@ -170,7 +232,11 @@ pub struct DeleteResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, DscRepoSchema)]
-#[dsc_repo_schema(base_name = "delete", folder_path = "outputs/resource")]
+#[dsc_repo_schema(base_name = "delete.whatIf", folder_path = "outputs/resource")]
+#[schemars(
+    transform = DeleteWhatIfResult::transform_export_schema_uris,
+    transform = DeleteWhatIfResult::transform_schema_docs
+)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteWhatIfResult {
     #[serde(rename = "whatIf", skip_serializing_if = "Option::is_none")]
