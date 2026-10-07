@@ -1,17 +1,21 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Downloads and extracts a DSCv3 resource package for Azure Machine Configuration.
+    Downloads and extracts a DSCv3 resource package from a DSC Resource Repository (dscpkg POC).
 
 .DESCRIPTION
+    Illustrative PowerShell POC for dscpkg. It uses direct resource descriptor URLs
+    and the first reachable discovery origin. Catalog lookup, per-resource repository
+    precedence, descriptor digest/ETag tracking, and content signing are not implemented.
+
     Implements the package download flow:
       1. Coded against an API version (the ".well-known" discovery document version keys).
       2. Configured with one or more hostnames and a packages directory.
       3. Discovers API endpoints via service discovery
-         (%hostname%/.well-known/azuremachineconfiguration.json).
+         (%hostname%/.well-known/dsc.json).
       4. Takes a resource type and version.
       5. Discovers the package for the resource type
-         (%MODULE_API_ENDPOINT%/%resource%/%version%/index.json).
+         (%RESOURCE_API_ENDPOINT%/%resource%/%version%.json).
       6. Discovers the archive for the package
          (%PACKAGE_API_ENDPOINT%/%package%/%package_version%.json).
       7. Selects the archive URL by platform (os_arch).
@@ -33,7 +37,7 @@
     The resource type version, e.g. "2026-06-30-preview".
 
 .PARAMETER Hostname
-    One or more service hostnames to use for discovery. The first hostname that
+    One or more repository hostnames to use for discovery. The first hostname that
     successfully serves the discovery document is used.
 
 .PARAMETER PackagesDirectory
@@ -41,7 +45,7 @@
 
 .PARAMETER PackageVersion
     Optional. The specific package version to download. When omitted, the highest
-    version advertised by the module index is selected.
+    version advertised by the resource descriptor is selected.
 
 .PARAMETER Platform
     Optional. The os_arch platform key, e.g. "windows_amd64", "linux_amd64",
@@ -58,13 +62,13 @@
     updates complete.
 
 .EXAMPLE
-    .\Get-AzMCResource.ps1 -Resource "Microsoft.GuestConfiguration/users" -Version "2026-06-30-preview"
+    .\Get-DscResource.ps1 -Resource "Microsoft.GuestConfiguration/users" -Version "2026-06-30-preview" -Hostname "https://resources.example.com"
 
 .EXAMPLE
-    .\Get-AzMCResource.ps1 `
+    .\Get-DscResource.ps1 `
         -Resource "Microsoft.GuestConfiguration/users" `
         -Version "2026-06-30-preview" `
-        -Hostname "agentserviceapi.guestconfiguration.azure.com" `
+        -Hostname "https://resources.example.com" `
         -Platform "linux_amd64"
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -76,7 +80,7 @@ param(
     [string] $Version,
 
     [Parameter()]
-    [string[]] $Hostname = @('agentserviceapi.guestconfiguration.azure.com'),
+    [string[]] $Hostname,
 
     [Parameter()]
     [string] $PackagesDirectory = (Join-Path $PSScriptRoot 'packages'),
@@ -235,21 +239,21 @@ function Resolve-ResourcePackage {
     param(
         [Parameter(Mandatory)][string] $Resource,
         [Parameter(Mandatory)][string] $Version,
-        [Parameter(Mandatory)][string] $ModuleEndpoint,
+        [Parameter(Mandatory)][string] $ResourceEndpoint,
         [Parameter(Mandatory)][string] $PackagesDirectory,
         [Parameter()][string] $PackageVersion
     )
 
     $resourcePath = $Resource.Trim('/').ToLowerInvariant()
     $resourceVersion = $Version.ToLowerInvariant()
-    $moduleIndexUri = "$($ModuleEndpoint.TrimEnd('/'))/$resourcePath/$resourceVersion.json"
-    $moduleIndex = Get-JsonFromUri -Uri $moduleIndexUri
+    $resourceDescriptorUri = "$($ResourceEndpoint.TrimEnd('/'))/$resourcePath/$resourceVersion.json"
+    $resourceDescriptor = Get-JsonFromUri -Uri $resourceDescriptorUri
 
-    if (-not $moduleIndex.PSObject.Properties['packages']) {
-        throw "Module index '$moduleIndexUri' does not contain a 'packages' object."
+    if (-not $resourceDescriptor.PSObject.Properties['packages']) {
+        throw "Resource descriptor '$resourceDescriptorUri' does not contain a 'packages' object."
     }
 
-    $packageProperties = @($moduleIndex.packages.PSObject.Properties)
+    $packageProperties = @($resourceDescriptor.packages.PSObject.Properties)
     if ($packageProperties.Count -eq 0) {
         throw "No packages found for resource '$Resource' version '$Version'."
     }
@@ -279,7 +283,7 @@ function Resolve-ResourcePackage {
         Version        = $resourceVersion
         Package        = $packageName
         PackageVersion = $PackageVersion
-        ModuleIndexUri = $moduleIndexUri
+        ResourceDescriptorUri = $resourceDescriptorUri
         Path           = $destination
     }
 }
@@ -439,7 +443,7 @@ function Set-DscResourcePathFromPackages {
 function Resolve-RegisteredResourcePackage {
     param(
         [Parameter(Mandatory)][string] $PackagesDirectory,
-        [Parameter(Mandatory)][string] $ModuleEndpoint
+        [Parameter(Mandatory)][string] $ResourceEndpoint
     )
 
     $registry = Read-LocalResourceRegistry -PackagesDirectory $PackagesDirectory
@@ -452,7 +456,7 @@ function Resolve-RegisteredResourcePackage {
         Resolve-ResourcePackage `
             -Resource $registeredResource.resource `
             -Version $registeredResource.version `
-            -ModuleEndpoint $ModuleEndpoint `
+            -ResourceEndpoint $ResourceEndpoint `
             -PackagesDirectory $PackagesDirectory
     }
 }
@@ -536,7 +540,7 @@ function Get-DiscoveryDocument {
         else {
             $base = "https://$($serviceHost.TrimEnd('/'))"
         }
-        $uri = "$base/.well-known/azuremachineconfiguration.json"
+        $uri = "$base/.well-known/dsc.json"
         try {
             return Get-JsonFromUri -Uri $uri
         }
@@ -549,6 +553,10 @@ function Get-DiscoveryDocument {
 }
 
 # --- Main flow -------------------------------------------------------------
+
+if (-not $Hostname -or $Hostname.Count -eq 0) {
+    throw "Hostname is required. Specify one or more DSC Resource Repository origins."
+}
 
 if (-not $Platform) {
     $Platform = Get-CurrentPlatform
@@ -566,20 +574,20 @@ if ((-not $isInstallMode) -and $PackageVersion) {
 
 # 3. Discover API endpoints.
 $discovery = Get-DiscoveryDocument -Hostnames $Hostname
-$moduleEndpoint = $discovery.'modules.v1'
+$resourceEndpoint = $discovery.'resources.v1'
 $packageEndpoint = $discovery.'packages.v1'
 
-if (-not $moduleEndpoint) { throw "Discovery document is missing 'modules.v1'." }
+if (-not $resourceEndpoint) { throw "Discovery document is missing 'resources.v1'." }
 if (-not $packageEndpoint) { throw "Discovery document is missing 'packages.v1'." }
 
-Write-Verbose "modules.v1  = $moduleEndpoint"
+Write-Verbose "resources.v1  = $resourceEndpoint"
 Write-Verbose "packages.v1 = $packageEndpoint"
 
 if ($isInstallMode) {
     $resolvedPackage = Resolve-ResourcePackage `
         -Resource $Resource `
         -Version $Version `
-        -ModuleEndpoint $moduleEndpoint `
+        -ResourceEndpoint $resourceEndpoint `
         -PackagesDirectory $PackagesDirectory `
         -PackageVersion $PackageVersion
 
@@ -626,7 +634,7 @@ if ($isInstallMode) {
 
 $resolvedPackages = @(Resolve-RegisteredResourcePackage `
     -PackagesDirectory $PackagesDirectory `
-    -ModuleEndpoint $moduleEndpoint)
+    -ResourceEndpoint $resourceEndpoint)
 
 if ($resolvedPackages.Count -eq 0) {
     Write-Warning "No registered resources found in '$(Get-ResourceRegistryPath -PackagesDirectory $PackagesDirectory)'."
