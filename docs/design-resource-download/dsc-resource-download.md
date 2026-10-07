@@ -30,10 +30,10 @@ implementation is provided [`Get-AzMCResource.ps1`](Get-AzMCResource.ps1).
 ## Advantages
 
 - **Completely static content.** Every endpoint in this flow — the discovery document,
-  the module index, the package documents, and the archives themselves — is a static
-  file. There is no server-side application logic, database, or dynamic request
-  handling required. The entire service can be hosted on any blob store or CDN, which
-  makes it cheap, highly available, trivially cacheable, and easy to mirror.
+  the catalog, the module index, the package documents, and the archives themselves —
+  is a static file. There is no server-side application logic, database, or dynamic
+  request handling required. The entire service can be hosted on any blob store or CDN,
+  which makes it cheap, highly available, trivially cacheable, and easy to mirror.
 - **Customers can host their own content repository.** Because the layout is just
   static files following a predictable path convention, a customer can stand up their
   own repository (e.g. a blob container or an internal CDN) and point the client at it
@@ -51,6 +51,7 @@ implementation is provided [`Get-AzMCResource.ps1`](Get-AzMCResource.ps1).
 | **Archive** | A `.zip` for a specific `os_arch` platform, with integrity hashes. |
 | **Platform key** | `os_arch`, e.g. `windows_amd64`, `linux_amd64`, `linux_arm64`. |
 | **Discovery document** | `/.well-known/azuremachineconfiguration.json`, lists versioned API endpoints. |
+| **Catalog** | Repository-level index that maps resource type + version pairs to module documents and their content digests. |
 | **Local resource registry** | Client-managed JSON file listing the resource type + version pairs currently registered on the machine. |
 
 ### Why modules and packages are separate
@@ -67,7 +68,7 @@ for every platform it supports**, selected at download time by the `os_arch` key
 The client is configured with:
 
 - **API version** — encoded as the discovery document keys it understands
-  (`modules.v1`, `packages.v1`).
+  (`catalog.v1`, `modules.v1`, `packages.v1`).
 - **Hostnames** — an ordered list of service origins. The first that successfully
   serves the discovery document wins. A value may be a bare hostname (defaults to
   `https://`) or a full base URL including scheme and port (e.g.
@@ -82,14 +83,19 @@ The client is configured with:
 sequenceDiagram
     participant Client as azmccli / Get-AzMCResource
     participant Disc as /.well-known
+    participant Cat as catalog.v1
     participant Mod as modules.v1
     participant Pkg as packages.v1
     participant CDN as archive host
 
     Client->>Disc: GET /.well-known/azuremachineconfiguration.json
-    Disc-->>Client: { modules.v1, packages.v1 }
-    Client->>Mod: GET {modules.v1}/{resource}/{version}.json
+    Disc-->>Client: { catalog.v1, modules.v1, packages.v1 }
+    Client->>Cat: GET {catalog.v1}
+    Cat-->>Client: catalog + ETag
+    Note over Client: locate module URL + digest for resource version
+    Client->>Mod: GET {module.url}
     Mod-->>Client: module index + signature (header or sidecar)
+    Note over Client: verify module digest from catalog
     Note over Client: verify signature if namespace requires signing
     Note over Client: select package + version (highest by default)
     Client->>Pkg: GET {packages.v1}/{package}/{packageVersion}.json
@@ -108,21 +114,24 @@ Step by step:
 3. **Service discovery** — `GET {host}/.well-known/azuremachineconfiguration.json`.
 4. The client is given a **resource type and version**
    (`azmccli get resource "Microsoft.GuestConfiguration/users" -version "2026-06-30-preview"`).
-5. **Module discovery** — construct `{modules.v1}/{resource}/{version}.json` and
-   select the package (and version — highest available unless one is requested).
-6. **Signature verification (module)** — locate the detached JWS for the module index
+5. **Catalog lookup** — fetch `{catalog.v1}` and locate the module document URL and
+   digest for the requested resource type and version.
+6. **Module discovery** — fetch the module document listed in the catalog, verify its
+   digest, and select the package (and version — highest available unless one is
+   requested).
+7. **Signature verification (module)** — locate the detached JWS for the module index
    document and validate it against the signing policy for the resource namespace, if one
    is active. See [Content signing](#content-signing).
-7. **Package discovery** — construct `{packages.v1}/{package}/{packageVersion}.json`.
-8. **Signature verification (package)** — locate the detached JWS for the package
+8. **Package discovery** — construct `{packages.v1}/{package}/{packageVersion}.json`.
+9. **Signature verification (package)** — locate the detached JWS for the package
    document and validate it against the signing policy for the package namespace, if one
    is active.
-9. **Platform selection** — pick the archive whose key matches the target `os_arch`.
-10. **Download + verify** — download the archive and verify its hash.
-11. **Extract** — into `{packagesDir}/{package}/{packageVersion}/`.
-12. **Expose** — prepend/append the package version directory to `DSC_RESOURCE_PATH`.
-13. **Register** — record the requested resource type and version in the local resource
-    registry so future update checks can re-resolve it.
+10. **Platform selection** — pick the archive whose key matches the target `os_arch`.
+11. **Download + verify** — download the archive and verify its hash.
+12. **Extract** — into `{packagesDir}/{package}/{packageVersion}/`.
+13. **Expose** — prepend/append the package version directory to `DSC_RESOURCE_PATH`.
+14. **Register** — record the requested resource type, version, and module `digest` in
+    the local resource registry so future update checks can re-resolve it.
 
 ## API contracts
 
@@ -130,10 +139,41 @@ Step by step:
 
 ```json
 {
+  "catalog.v1": "https://agentserviceapi.guestconfiguration.azure.com/v1/catalog.json",
   "modules.v1": "https://agentserviceapi.guestconfiguration.azure.com/v1/modules",
   "packages.v1": "https://agentserviceapi.guestconfiguration.azure.com/v1/packages"
 }
 ```
+
+### Catalog — `GET {catalog.v1}`
+
+The catalog is the repository-level index of available module documents. It should
+include an `ETag` response header so clients can use `If-None-Match` for periodic update
+checks. Any publish that adds, removes, or changes a module document must publish an
+updated catalog.
+
+The catalog `ETag` is an HTTP validator for the catalog response. It is separate from
+the per-entry `digest`, which identifies the referenced module document content.
+
+Catalog entries include a module document `url` and a content `digest`. The digest uses
+the same `algorithm:hex` format as archive hashes and identifies the exact module
+document bytes referenced by the catalog.
+
+```json
+{
+  "modules": {
+    "microsoft.guestconfiguration/users": {
+      "2026-06-30-preview": {
+        "url": "modules/microsoft.guestconfiguration/users/2026-06-30-preview.json",
+        "digest": "sha256:<hex>"
+      }
+    }
+  }
+}
+```
+
+- `url` may be **relative** (resolved against the catalog document URL) or **absolute**.
+- `digest` is checked after downloading the module document and before acting on it.
 
 ### Module index — `GET {modules.v1}/{resource}/{version}.json`
 
@@ -199,6 +239,7 @@ repository serving one resource type and one package:
 ```
 /.well-known/
   azuremachineconfiguration.json
+/catalog.json
 /modules/
   microsoft.guestconfiguration/
     users/
@@ -318,16 +359,19 @@ already-present path is not duplicated.
 ### Local resource registry
 
 `resources.json` is the local registry of resources that are registered on the
-machine. The registry stores only the durable resource intent: the resource type and
-resource version. Package names, package versions, archive URLs, hashes, and runtime
-paths are derived from the module index, package documents, and on-disk package cache.
+machine. The registry stores the durable resource intent — the resource type and
+resource version — plus an optional `digest` recording the last module document digest
+processed from the catalog. Package names, package versions, archive URLs, hashes, and
+runtime paths are derived from the catalog, module index, package documents, and on-disk
+package cache.
 
 ```json
 {
   "resources": [
     {
       "resource": "foo/bar",
-      "version": "2026-01-01"
+      "version": "2026-01-01",
+      "digest": "sha256:<hex>"
     }
   ]
 }
@@ -336,23 +380,99 @@ paths are derived from the module index, package documents, and on-disk package 
 The registry is not a package database. A package may provide multiple resources, and a
 resource may move to a different package version or package name over time. On each
 update check, the client re-resolves every registered `resource` + `version` through the
-module index and treats the result as the current desired package set.
+catalog and module index and treats the result as the current desired package set. If
+the catalog digest for a registered resource matches the local `digest`, no package
+update is needed for that resource. If the local package state is missing or suspect,
+the client ignores the local `digest` and re-resolves the resource from the catalog and
+module index.
 
 ### Background update and cleanup
 
 A background process periodically refreshes registered resources:
 
+```mermaid
+sequenceDiagram
+  participant Worker as background worker
+  participant Registry as resources.json
+  participant Disc as /.well-known
+  participant Cat as catalog.v1
+  participant Mod as modules.v1
+  participant Pkg as packages.v1
+  participant CDN as archive host
+  participant Cache as package cache
+
+  Worker->>Registry: read registered resources
+  Worker->>Disc: GET /.well-known/azuremachineconfiguration.json
+  Disc-->>Worker: { catalog.v1, modules.v1, packages.v1 }
+  Worker->>Cat: GET {catalog.v1} with If-None-Match
+  alt catalog unchanged
+    Cat-->>Worker: 304 Not Modified
+    Note over Worker: no package updates needed
+  else catalog changed
+    Cat-->>Worker: catalog + ETag
+    loop each registered resource
+      Note over Worker: lookup module URL + digest in catalog
+      alt catalog digest matches local digest
+        Note over Worker: no package update needed
+      else catalog digest changed or local digest is missing
+        Worker->>Mod: GET {module.url}
+        Mod-->>Worker: module index + signature
+        Note over Worker: verify module digest from catalog
+        Note over Worker: verify signature if namespace requires signing
+        Note over Worker: select desired package + version
+        Worker->>Registry: update digest for resource
+        alt selected package version is cached
+          Worker->>Cache: reuse existing package version directory
+        else selected package version is missing
+          Worker->>Pkg: GET {packages.v1}/{package}/{packageVersion}.json
+          Pkg-->>Worker: package doc + signature
+          Note over Worker: verify signature if namespace requires signing
+          Note over Worker: select archive by platform (os_arch)
+          Worker->>CDN: GET {archive.url}
+          CDN-->>Worker: package.zip
+          Worker->>Cache: verify hash and extract atomically
+        end
+      end
+    end
+  end
+  Worker->>Cache: regenerate DSC_RESOURCE_PATH from resolved package versions
+```
+
 1. Read `resources.json`.
-2. For each registered resource, fetch `{modules.v1}/{resource}/{version}.json`.
-3. Verify the module index signature when required by policy.
-4. Select the desired package version from the module index, using the same version
+2. Fetch `{catalog.v1}`, using `If-None-Match` when a catalog `ETag` is available.
+3. If the catalog returns `304 Not Modified`, skip package updates.
+4. If the catalog returns `200 OK`, look up every registered resource in the catalog.
+5. If the catalog digest matches the local `digest`, skip when package state is intact.
+6. If the catalog digest changed or the local `digest` is missing, fetch the module
+   document URL from the catalog and verify its digest.
+7. Verify the module index signature when required by policy.
+8. Select the desired package version from the module index, using the same version
    selection rules as the install flow.
-5. Fetch and verify the package document for any desired package version that is not
+9. Update the registered `digest` from the catalog entry.
+10. Fetch and verify the package document for any desired package version that is not
    already present in the package cache.
-6. Download, hash-check, and extract missing archives atomically.
-7. Regenerate the active `DSC_RESOURCE_PATH` entries from the resolved package versions.
+11. Download, hash-check, and extract missing archives atomically.
+12. Regenerate the active `DSC_RESOURCE_PATH` entries from the resolved package versions.
 
 The same pass can clean up cached packages that are no longer needed:
+
+```mermaid
+sequenceDiagram
+  participant Worker as background worker
+  participant Registry as resources.json
+  participant Cache as package cache
+
+  Worker->>Registry: read registered resources
+  Worker->>Worker: build required package version set
+  Worker->>Cache: enumerate cached package version directories
+  loop each cached package version
+    alt required by a registered resource
+      Worker->>Cache: keep package version
+    else unused and eligible
+      Worker->>Cache: delete package version directory
+    end
+  end
+```
 
 1. Build the set of package version directories required by all registered resources.
 2. Compare that set with the package versions present under `{packagesDir}`.
@@ -433,10 +553,11 @@ Example update and cleanup pass for registered resources:
   `OSArchitecture` (`amd64`/`arm64`/`386`) to the `os_arch` key.
 - **Version selection** parses the numeric prefix of each version as `System.Version`
   and chooses the highest; ties fall back to ordinal string comparison.
-- **Registration** — installing a resource records only its lowercase `resource` and
-  `version` in `resources.json`.
-- **Update** — registered resources are re-resolved through the module index; already
-  cached selected package versions are reused.
+- **Registration** — installing a resource records its lowercase `resource`, `version`,
+  and module `digest` in `resources.json`.
+- **Update** — registered resources are checked against the catalog; resources with
+  unchanged module digests are skipped, and already cached selected package versions are
+  reused.
 - **Cleanup** — cached package versions not required by the current registry are
   removed unless they are active in `DSC_RESOURCE_PATH`.
 - **Atomicity** — the archive downloads to a temp file; the destination version
@@ -447,7 +568,9 @@ Example update and cleanup pass for registered resources:
 The client fails fast (`$ErrorActionPreference = 'Stop'`) with actionable messages for:
 
 - Discovery failing for every configured hostname.
-- A discovery document missing `modules.v1` / `packages.v1`.
+- A discovery document missing `catalog.v1` / `modules.v1` / `packages.v1`.
+- A catalog missing the requested resource type and version.
+- A module document whose digest does not match the catalog entry.
 - A module index with no `packages`, or a package with no versions.
 - A requested package version not being available (lists what is).
 - A package document missing `archives`, or no archive for the target platform
